@@ -40,6 +40,10 @@ strpot run TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
 
 StrPot benchmarks complete native prefill and decode candidates once and caches the fastest portable thread count for that model and engine build. Pass `--threads N` to override autotuning explicitly.
 
+The native data plane also accepts immutable, canonically hashed execution plans. Plans declare typed SSA values, exact checkpoint tensor bindings, operator order, and numerical semantics; the native consumer independently validates those declarations before execution. The shared operator registry is exercised by materially different RMSNorm/RoPE/SwiGLU and LayerNorm/learned-position/GELU decoder graphs.
+
+An experimental Qwen2-family adapter emits this same plan contract, including Q/K/V projection bias, grouped-query attention, RoPE, SwiGLU, tied output heads, and declared BF16 boundaries. Deterministic nonzero fixtures validate the adapter and native executor; support outside the explicitly validated configuration fails closed.
+
 Test exact response-space execution for layer-0 Q/K/V:
 
 ```bash
