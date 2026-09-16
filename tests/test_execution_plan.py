@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import struct
 import subprocess
 from dataclasses import replace
@@ -16,6 +17,7 @@ from strpot.native import (
     GraphValue,
     NativeExecutionPlanEngine,
     NativePlanGenerationResult,
+    NativePlanTokenWaveResult,
     NumericalSemantics,
     Operator,
     TensorBinding,
@@ -1397,3 +1399,261 @@ def test_unaligned_bf16_decode_offsets_are_ubsan_clean(tmp_path: Path) -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "runtime error" not in completed.stderr
+
+
+def _token_wave_fixture(
+    tmp_path: Path, *, dtype: str = "F32"
+) -> tuple[ExecutionPlan, Path]:
+    tensors = {
+        "embed": ((4, 4), [0.25, 0.5, 0.75, 1.0] * 4),
+        "q": ((4, 4), _identity(4, 4, 0.5)),
+        "k": ((2, 4), _identity(2, 4, 0.5)),
+        "v": ((2, 4), _identity(2, 4, 0.5)),
+        "o": ((4, 4), _identity(4, 4, 0.5)),
+        "head": ((4, 4), [0.0] * 16),
+        "head_bias": ((4,), [0.0, 10.0, 0.0, 0.0]),
+    }
+    source = tmp_path / "wave.safetensors"
+    if dtype == "BF16":
+        _write_bf16_safetensors(source, tensors)
+    else:
+        _write_f32_safetensors(source, tensors)
+    image = tmp_path / "wave.strpot"
+    compile_image(source, image)
+    return (
+        ExecutionPlan(
+            version=1,
+            architecture_id="generic-wave-probe",
+            config_identity="wave-v1",
+            shapes=(("hidden_size", 4), ("vocab_size", 4), ("context_size", 64)),
+            semantics=(
+                replace(
+                    _f32_semantics(),
+                    weight_dtype="BF16",
+                    activation_dtype="BF16",
+                    output_dtype="BF16",
+                )
+                if dtype == "BF16"
+                else _f32_semantics()
+            ),
+            tensors=tuple(
+                TensorBinding(name, name, dtype, shape)
+                for name, (shape, _values) in tensors.items()
+            ),
+            values=(
+                GraphValue("hidden", dtype, ("hidden_size",), "activation"),
+                GraphValue("attended", dtype, ("hidden_size",), "activation"),
+                GraphValue("logits", dtype, ("vocab_size",), "logits"),
+            ),
+            operators=(
+                Operator("embedding", outputs=("hidden",), tensors=("embed",)),
+                Operator(
+                    "attention_causal",
+                    inputs=("hidden",),
+                    outputs=("attended",),
+                    tensors=("q", "k", "v", "o"),
+                    attributes=(("cache", "slot0"), ("heads", "2"), ("kv_heads", "1")),
+                ),
+                Operator(
+                    "linear",
+                    inputs=("attended",),
+                    outputs=("logits",),
+                    tensors=("head", "head_bias"),
+                ),
+            ),
+            eos_token_id=-1,
+        ),
+        image,
+    )
+
+
+@pytest.mark.parametrize("max_proposals", [1, 2, 3])
+def test_generic_token_wave_commits_multiple_exact_tokens_per_traversal(
+    tmp_path: Path, max_proposals: int
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path)
+    engine = NativeExecutionPlanEngine(
+        plan=plan, weights_image=image, cache_root=tmp_path / f"wave-{max_proposals}"
+    )
+    prompt = [1] * 10
+    ordinary = engine.generate(prompt, max_new_tokens=8, threads=2)
+    wave: NativePlanTokenWaveResult = engine.generate_token_wave(
+        prompt, max_new_tokens=8, max_proposals=max_proposals, threads=2
+    )
+
+    assert wave.generated_token_ids == ordinary.generated_token_ids
+    assert wave.frontier_logits_hashes == ordinary.frontier_logits_hashes
+    assert wave.frontier_kv_hashes == ordinary.frontier_kv_hashes
+    assert wave.final_logits_hash == ordinary.final_logits_hash
+    assert wave.final_kv_hash == ordinary.final_kv_hash
+    assert wave.final_kv_lengths == ordinary.kv_cache_lengths
+    assert wave.committed_tokens_per_target_weight_traversal > 1.0
+    assert max(wave.acceptance_lengths) >= 1
+    assert wave.transactional_snapshot_bytes_copied == 0
+
+
+def test_generic_token_wave_rejection_rolls_back_to_every_ordinary_frontier(
+    tmp_path: Path,
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path)
+    engine = NativeExecutionPlanEngine(
+        plan=plan, weights_image=image, cache_root=tmp_path / "wave-reject"
+    )
+    prompt = [1] * 10
+    ordinary = engine.generate(prompt, max_new_tokens=7, threads=1)
+    rejected = engine.generate_token_wave(
+        prompt,
+        max_new_tokens=7,
+        max_proposals=3,
+        threads=1,
+        adversarial_proposals=True,
+    )
+
+    assert rejected.generated_token_ids == ordinary.generated_token_ids
+    assert rejected.frontier_logits_hashes == ordinary.frontier_logits_hashes
+    assert rejected.frontier_kv_hashes == ordinary.frontier_kv_hashes
+    assert rejected.final_logits_hash == ordinary.final_logits_hash
+    assert rejected.final_kv_hash == ordinary.final_kv_hash
+    assert rejected.rolled_back_tokens > 0
+    assert rejected.rollback_verified
+    assert rejected.fallback_traversals > 0
+
+
+def test_generic_token_wave_weak_history_uses_width_one_fallback(
+    tmp_path: Path,
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path)
+    engine = NativeExecutionPlanEngine(
+        plan=plan, weights_image=image, cache_root=tmp_path / "wave-fallback"
+    )
+    wave = engine.generate_token_wave(
+        [0, 1, 2, 3], max_new_tokens=3, max_proposals=3, threads=1
+    )
+
+    assert wave.speculative_traversals == 0
+    assert wave.fallback_traversals == 2
+    assert wave.acceptance_lengths == (0, 0)
+    assert wave.committed_tokens_per_target_weight_traversal == 1.0
+
+
+@pytest.mark.parametrize("width", [8, 16])
+def test_perfect_oracle_portable_fallback_preserves_every_native_frontier(
+    tmp_path: Path, width: int
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path, dtype="BF16")
+    engine = NativeExecutionPlanEngine(
+        plan=plan, weights_image=image, cache_root=tmp_path / f"oracle-{width}"
+    )
+    prompt = [1] * 10
+    ordinary = engine.generate(prompt, max_new_tokens=17, threads=2)
+    oracle = engine._experimental_generate_perfect_oracle(
+        prompt,
+        known_future_token_ids=list(ordinary.generated_token_ids),
+        width=width,
+        threads=2,
+    )
+
+    assert oracle.generated_token_ids == ordinary.generated_token_ids
+    assert oracle.frontier_logits_hashes == ordinary.frontier_logits_hashes
+    assert oracle.frontier_kv_hashes == ordinary.frontier_kv_hashes
+    assert oracle.final_logits_hash == ordinary.final_logits_hash
+    assert oracle.final_kv_hash == ordinary.final_kv_hash
+    assert oracle.final_kv_lengths == ordinary.kv_cache_lengths
+    assert oracle.target_weight_traversals == (16 + width - 1) // width
+    assert oracle.committed_decode_tokens == 16
+    assert oracle.acceptance_lengths[0] == width - 1
+    assert len(oracle.traversal_seconds) == oracle.target_weight_traversals
+    assert oracle.transactional_snapshot_bytes_copied == 0
+    assert oracle.kernel_family == "portable-tiled"
+    assert oracle.native_panel_8_calls == 0
+    assert oracle.native_panel_16_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("prompt_length", "max_new_tokens", "width"),
+    [(10, 2, 8), (10, 10, 8), (63, 2, 16)],
+)
+def test_perfect_oracle_never_materializes_the_terminal_output_in_kv(
+    tmp_path: Path, prompt_length: int, max_new_tokens: int, width: int
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path, dtype="BF16")
+    engine = NativeExecutionPlanEngine(
+        plan=plan,
+        weights_image=image,
+        cache_root=tmp_path / f"oracle-terminal-{prompt_length}-{width}",
+    )
+    prompt = [1] * prompt_length
+    ordinary = engine.generate(prompt, max_new_tokens=max_new_tokens, threads=2)
+
+    oracle = engine._experimental_generate_perfect_oracle(
+        prompt,
+        known_future_token_ids=list(ordinary.generated_token_ids),
+        width=width,
+        threads=2,
+    )
+
+    assert oracle.generated_token_ids == ordinary.generated_token_ids
+    assert oracle.frontier_logits_hashes == ordinary.frontier_logits_hashes
+    assert oracle.frontier_kv_hashes == ordinary.frontier_kv_hashes
+    assert oracle.final_logits_hash == ordinary.final_logits_hash
+    assert oracle.final_kv_hash == ordinary.final_kv_hash
+    assert oracle.final_kv_lengths == ordinary.kv_cache_lengths
+    assert oracle.committed_decode_tokens == max_new_tokens - 1
+    assert oracle.final_kv_lengths == (prompt_length + max_new_tokens - 1,)
+
+
+def test_native_token_wave_cli_rejects_more_than_three_proposals(
+    tmp_path: Path,
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path)
+    engine = NativeExecutionPlanEngine(
+        plan=plan, weights_image=image, cache_root=tmp_path / "wave-cli-bound"
+    )
+
+    completed = subprocess.run(
+        [
+            str(engine.executable),
+            "--token-wave",
+            str(engine.artifact),
+            str(engine.checkpoint),
+            "1,1,1,1",
+            "2",
+            "4",
+            "1",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "max_proposals must be between zero and three" in completed.stderr
+
+
+@pytest.mark.skipif(platform.machine() != "arm64", reason="AArch64 NEON telemetry")
+@pytest.mark.parametrize("width", [8, 16])
+def test_native_position_panel_reports_fixed_width_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    plan, image = _token_wave_fixture(tmp_path, dtype="BF16")
+    engine = NativeExecutionPlanEngine(
+        plan=plan, weights_image=image, cache_root=tmp_path / f"panel-{width}"
+    )
+    prompt = [1] * 10
+    ordinary = engine.generate(prompt, max_new_tokens=17, threads=2)
+    monkeypatch.setenv("STRPOT_EXPERIMENTAL_NATIVE_POSITION_PANEL", "1")
+
+    panel = engine._experimental_generate_perfect_oracle(
+        prompt,
+        known_future_token_ids=list(ordinary.generated_token_ids),
+        width=width,
+        threads=2,
+    )
+
+    assert panel.generated_token_ids == ordinary.generated_token_ids
+    assert panel.frontier_logits_hashes == ordinary.frontier_logits_hashes
+    assert panel.frontier_kv_hashes == ordinary.frontier_kv_hashes
+    assert panel.kernel_family == "experimental-native-position-panel-neon"
+    assert (panel.native_panel_8_calls > 0) is (width == 8)
+    assert (panel.native_panel_16_calls > 0) is (width == 16)
