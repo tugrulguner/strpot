@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Testing and tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# StrPot model images
+*.strpot/
+
+# OS and IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
