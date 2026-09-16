@@ -10,8 +10,9 @@ runner = CliRunner()
 
 
 def test_help() -> None:
-    result = runner.invoke(app, ["--help"])
-    run_help = runner.invoke(app, ["run", "--help"])
+    environment = {"COLUMNS": "120"}
+    result = runner.invoke(app, ["--help"], env=environment)
+    run_help = runner.invoke(app, ["run", "--help"], env=environment)
     assert result.exit_code == 0
     assert "bounded" in result.stdout
     assert run_help.exit_code == 0
