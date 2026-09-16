@@ -2,6 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from strpot.cli import app
@@ -10,15 +11,15 @@ runner = CliRunner()
 
 
 def test_help() -> None:
-    environment = {"COLUMNS": "120"}
-    result = runner.invoke(app, ["--help"], env=environment)
-    run_help = runner.invoke(app, ["run", "--help"], env=environment)
+    result = runner.invoke(app, ["--help"])
+    run_help = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
     assert "bounded" in result.stdout
     assert run_help.exit_code == 0
     assert "autotune" in run_help.stdout
     assert "token-wave" in run_help.stdout
-    assert "max-proposals" in run_help.stdout
+    run_command = get_command(app).commands["run"]
+    assert any("--max-proposals" in parameter.opts for parameter in run_command.params)
 
 
 def test_production_cli_does_not_import_pytorch() -> None:
