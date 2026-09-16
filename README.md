@@ -44,6 +44,8 @@ The native data plane also accepts immutable, canonically hashed execution plans
 
 An experimental Qwen2-family adapter emits this same plan contract, including Q/K/V projection bias, grouped-query attention, RoPE, SwiGLU, tied output heads, and declared BF16 boundaries. Deterministic nonzero fixtures validate the adapter and native executor; support outside the explicitly validated configuration fails closed.
 
+The same executor also provides opt-in exact token-wave verification. It evaluates tentative causal blocks, commits only the longest target-verified prefix, and rolls rejected KV suffixes back to an append-only checkpoint. Fixed-width P8 and P16 position panels are available as an experimental AArch64 backend behind a portable fallback. An internal perfect-oracle mode measures only the execution ceiling with known future tokens; it is an upper bound, not ordinary generation throughput. The Llama-family and Qwen2-family adapters share the immutable plan and native operator registry.
+
 Test exact response-space execution for layer-0 Q/K/V:
 
 ```bash

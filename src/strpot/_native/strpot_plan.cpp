@@ -31,6 +31,9 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace {
 
@@ -548,9 +551,26 @@ private:
 class Executor {
     struct Cache { std::vector<float> key; std::vector<float> value; std::size_t length{}; std::size_t kv_heads{}; std::size_t head_dim{}; };
     struct CompiledOp { const Op* op{}; std::vector<const Tensor*> tensors; };
+    struct CacheMark { std::size_t key_size{}; std::size_t value_size{}; std::size_t length{}; std::uint64_t key_hash{}; std::uint64_t value_hash{}; };
 public:
+    struct TokenWaveResult {
+        std::vector<int> tokens;
+        std::vector<std::size_t> acceptance_lengths;
+        std::vector<double> traversal_seconds;
+        std::size_t target_weight_traversals{};
+        std::size_t committed_decode_tokens{};
+        std::size_t rolled_back_tokens{};
+        std::size_t speculative_traversals{};
+        std::size_t fallback_traversals{};
+        std::size_t transactional_snapshot_bytes_copied{};
+        bool rollback_verified{true};
+    };
     Executor(Plan plan, const std::string& checkpoint, std::size_t threads)
-        : plan_(std::move(plan)), weights_(checkpoint), parallel_(threads) {
+        : plan_(std::move(plan)), weights_(checkpoint), parallel_(threads),
+          experimental_position_panel_(std::getenv("STRPOT_EXPERIMENTAL_NATIVE_POSITION_PANEL") != nullptr && std::string(std::getenv("STRPOT_EXPERIMENTAL_NATIVE_POSITION_PANEL")) == "1") {
+#if !defined(__aarch64__)
+        if (experimental_position_panel_) throw std::runtime_error("experimental native position panel requires AArch64 NEON");
+#endif
         validate();
     }
 
@@ -575,6 +595,8 @@ public:
         std::vector<int> result;
         for (std::size_t index = 0; index < max_new; ++index) {
             frontier_logits_.push_back(logits);
+            frontier_logits_hashes_.push_back(hash_floats(logits));
+            frontier_kv_hashes_.push_back(hash_caches());
             int token = static_cast<int>(std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
             result.push_back(token);
             if (token == plan_.eos_token_id || index + 1 == max_new) break;
@@ -587,9 +609,117 @@ public:
         return result;
     }
 
+    TokenWaveResult generate_token_wave(const std::vector<int>& prompt, std::size_t max_new, std::size_t max_proposals, bool adversarial) {
+        if (prompt.empty()) throw std::runtime_error("prompt cannot be empty");
+        if (!max_new) throw std::runtime_error("max_new must be positive");
+        if (max_proposals > 3) throw std::runtime_error("max_proposals must be between zero and three");
+        const auto context = shape("context_size"), vocab = shape("vocab_size");
+        if (prompt.size() > context) throw std::runtime_error("generation exceeds plan context bound");
+        for (const int token : prompt) if (token < 0 || static_cast<std::size_t>(token) >= vocab) throw std::runtime_error("token outside embedding table");
+        const auto prefill_start = std::chrono::steady_clock::now(); matrix_passes_ = 0;
+        std::vector<float> logits = forward_block(prompt, position_); position_ += prompt.size();
+        prefill_matrix_passes_ = matrix_passes_; prefill_physical_width_ = prompt.size();
+        prefill_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
+        TokenWaveResult result; std::vector<int> history = prompt; std::size_t backoff = 0;
+        while (result.tokens.size() < max_new) {
+            frontier_logits_.push_back(logits); frontier_logits_hashes_.push_back(hash_floats(logits)); frontier_kv_hashes_.push_back(hash_caches());
+            const int pending = greedy_token(logits); result.tokens.push_back(pending); history.push_back(pending);
+            if (pending == plan_.eos_token_id || result.tokens.size() == max_new) break;
+            if (position_ >= context) throw std::runtime_error("generation exceeds plan context bound");
+            const std::size_t remaining = max_new - result.tokens.size();
+            const std::size_t capacity = context - position_;
+            const std::size_t proposal_limit = remaining > 1 && capacity > 1 ? std::min(max_proposals, std::min(remaining - 1, capacity - 1)) : 0;
+            auto proposals = backoff == 0 ? propose_ngrams(history, proposal_limit) : std::vector<int>{};
+            if (backoff) --backoff;
+            if (adversarial && !proposals.empty()) proposals[0] = (proposals[0] + 1) % static_cast<int>(vocab);
+            const auto started = std::chrono::steady_clock::now();
+            if (proposals.empty()) {
+                logits = forward(pending, position_++);
+                result.traversal_seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                ++result.target_weight_traversals; ++result.committed_decode_tokens; ++result.fallback_traversals; result.acceptance_lengths.push_back(0); continue;
+            }
+            std::vector<int> block{pending}; block.insert(block.end(), proposals.begin(), proposals.end());
+            const auto marks = cache_marks(); const std::size_t first_position = position_;
+            auto all_logits = forward_block_all(block, first_position);
+            result.traversal_seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            ++result.target_weight_traversals; ++result.speculative_traversals;
+            std::size_t accepted = 0;
+            while (accepted < proposals.size()) {
+                const auto begin = all_logits.begin() + static_cast<std::ptrdiff_t>(accepted * vocab);
+                std::vector<float> position_logits(begin, begin + static_cast<std::ptrdiff_t>(vocab));
+                if (greedy_token(position_logits) != proposals[accepted]) break;
+                frontier_logits_.push_back(position_logits); frontier_logits_hashes_.push_back(hash_floats(position_logits));
+                frontier_kv_hashes_.push_back(hash_caches_at(marks, 1 + accepted));
+                result.tokens.push_back(proposals[accepted]); history.push_back(proposals[accepted]); ++accepted;
+                if (result.tokens.size() == max_new || proposals[accepted - 1] == plan_.eos_token_id) break;
+            }
+            result.acceptance_lengths.push_back(accepted); if (!accepted) backoff = 2;
+            const std::size_t committed = 1 + accepted; result.committed_decode_tokens += committed;
+            if (committed < block.size()) { result.rolled_back_tokens += block.size() - committed; rollback(marks, committed); result.rollback_verified = result.rollback_verified && verify_rollback(marks, committed); }
+            position_ = first_position + committed;
+            const auto next = all_logits.begin() + static_cast<std::ptrdiff_t>(accepted * vocab); logits.assign(next, next + static_cast<std::ptrdiff_t>(vocab));
+            if (result.tokens.size() == max_new || result.tokens.back() == plan_.eos_token_id) break;
+        }
+        return result;
+    }
+
+    // EXPERIMENTAL CEILING ONLY: known_future is produced by an untimed ordinary
+    // decode. This measures exact causal-panel execution, not practical drafting.
+    TokenWaveResult generate_perfect_oracle(const std::vector<int>& prompt, const std::vector<int>& known_future, std::size_t width) {
+        if (prompt.empty()) throw std::runtime_error("prompt cannot be empty");
+        if (known_future.empty()) throw std::runtime_error("perfect-oracle future cannot be empty");
+        if (width != 1 && width != 2 && width != 4 && width != 8 && width != 16) throw std::runtime_error("perfect-oracle width must be 1, 2, 4, 8, or 16");
+        const auto context = shape("context_size"), vocab = shape("vocab_size");
+        if (prompt.size() > context || known_future.size() > context - prompt.size() + 1) throw std::runtime_error("generation exceeds plan context bound");
+        for (const int token : prompt) if (token < 0 || static_cast<std::size_t>(token) >= vocab) throw std::runtime_error("token outside embedding table");
+        for (const int token : known_future) if (token < 0 || static_cast<std::size_t>(token) >= vocab) throw std::runtime_error("perfect-oracle token outside embedding table");
+        const auto prefill_start = std::chrono::steady_clock::now(); matrix_passes_ = 0;
+        std::vector<float> logits = forward_block(prompt, position_); position_ += prompt.size();
+        prefill_matrix_passes_ = matrix_passes_; prefill_physical_width_ = prompt.size();
+        prefill_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefill_start).count();
+        TokenWaveResult result; std::size_t cursor = 0;
+        while (cursor < known_future.size()) {
+            frontier_logits_.push_back(logits); frontier_logits_hashes_.push_back(hash_floats(logits)); frontier_kv_hashes_.push_back(hash_caches());
+            const int pending = greedy_token(logits);
+            if (pending != known_future[cursor]) throw std::runtime_error("supplied perfect-oracle future does not match target decode");
+            result.tokens.push_back(pending); ++cursor;
+            if (cursor == known_future.size() || pending == plan_.eos_token_id) break;
+            if (position_ >= context) throw std::runtime_error("generation exceeds plan context bound");
+            const std::size_t remaining_future = known_future.size() - cursor;
+            const std::size_t remaining_context = context - position_;
+            const std::size_t proposals_count = remaining_future > 1 && remaining_context > 1
+                ? std::min(width - 1, std::min(remaining_future - 1, remaining_context - 1))
+                : 0;
+            std::vector<int> block{pending};
+            block.insert(block.end(), known_future.begin() + static_cast<std::ptrdiff_t>(cursor), known_future.begin() + static_cast<std::ptrdiff_t>(cursor + proposals_count));
+            const auto marks = cache_marks(); const std::size_t first_position = position_;
+            const auto started = std::chrono::steady_clock::now();
+            auto all_logits = forward_block_all(block, first_position);
+            result.traversal_seconds.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            ++result.target_weight_traversals; ++result.speculative_traversals; result.committed_decode_tokens += block.size();
+            result.acceptance_lengths.push_back(proposals_count);
+            for (std::size_t accepted = 0; accepted < proposals_count; ++accepted) {
+                const auto begin = all_logits.begin() + static_cast<std::ptrdiff_t>(accepted * vocab);
+                std::vector<float> position_logits(begin, begin + static_cast<std::ptrdiff_t>(vocab));
+                if (greedy_token(position_logits) != known_future[cursor]) throw std::runtime_error("supplied perfect-oracle future does not match target decode");
+                frontier_logits_.push_back(position_logits); frontier_logits_hashes_.push_back(hash_floats(position_logits));
+                frontier_kv_hashes_.push_back(hash_caches_at(marks, 1 + accepted));
+                result.tokens.push_back(known_future[cursor]); ++cursor;
+            }
+            position_ = first_position + block.size();
+            const auto next = all_logits.begin() + static_cast<std::ptrdiff_t>(proposals_count * vocab);
+            logits.assign(next, next + static_cast<std::ptrdiff_t>(vocab));
+        }
+        return result;
+    }
+
     std::size_t executed() const { return executed_; }
     const std::vector<std::string>& trace() const { return trace_; }
     const std::vector<std::vector<float>>& frontier_logits() const { return frontier_logits_; }
+    const std::vector<std::uint64_t>& frontier_logits_hashes() const { return frontier_logits_hashes_; }
+    const std::vector<std::uint64_t>& frontier_kv_hashes() const { return frontier_kv_hashes_; }
+    std::uint64_t final_logits_hash() const { return frontier_logits_.empty() ? hash_floats(std::vector<float>{}) : hash_floats(frontier_logits_.back()); }
+    std::uint64_t final_kv_hash() const { return hash_caches(); }
     const std::vector<double>& decode_intervals() const { return decode_intervals_; }
     const Plan& plan() const { return plan_; }
     std::size_t matrix_passes() const { return matrix_passes_; }
@@ -600,7 +730,10 @@ public:
     std::size_t prefill_matrix_passes() const { return prefill_matrix_passes_; }
     double prefill_seconds() const { return prefill_seconds_; }
     std::size_t prefill_physical_width() const { return prefill_physical_width_; }
-    const char* kernel_family() const { return "portable-tiled"; }
+    const char* kernel_family() const { return native_panel_8_calls_ || native_panel_16_calls_ ? "experimental-native-position-panel-neon" : "portable-tiled"; }
+    std::size_t native_panel_8_calls() const { return native_panel_8_calls_; }
+    std::size_t native_panel_16_calls() const { return native_panel_16_calls_; }
+    std::size_t native_panel_packed_input_bytes() const { return native_panel_packed_input_bytes_; }
     std::vector<std::size_t> cache_lengths() const {
         std::vector<std::size_t> values;
         for (const auto& name : cache_order_) values.push_back(caches_.at(name).length);
@@ -618,6 +751,51 @@ public:
     }
 
 private:
+    static int greedy_token(const std::vector<float>& logits) { return static_cast<int>(std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()))); }
+    static std::uint64_t hash_bytes(std::uint64_t hash, const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (std::size_t index = 0; index < size; ++index) { hash ^= bytes[index]; hash *= 1099511628211ULL; }
+        return hash;
+    }
+    static std::uint64_t hash_floats(const std::vector<float>& values) { return hash_bytes(1469598103934665603ULL, values.data(), values.size() * sizeof(float)); }
+    std::uint64_t hash_caches() const {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const auto& name : cache_order_) { const auto& cache = caches_.at(name); hash = hash_bytes(hash, &cache.length, sizeof(cache.length)); hash = hash_bytes(hash, cache.key.data(), cache.key.size() * sizeof(float)); hash = hash_bytes(hash, cache.value.data(), cache.value.size() * sizeof(float)); }
+        return hash;
+    }
+    std::vector<CacheMark> cache_marks() const {
+        std::vector<CacheMark> marks; marks.reserve(cache_order_.size());
+        for (const auto& name : cache_order_) { const auto& cache = caches_.at(name); marks.push_back({cache.key.size(), cache.value.size(), cache.length, hash_floats(cache.key), hash_floats(cache.value)}); }
+        return marks;
+    }
+    std::uint64_t hash_caches_at(const std::vector<CacheMark>& marks, std::size_t committed) const {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (std::size_t slot = 0; slot < cache_order_.size(); ++slot) { const auto& cache = caches_.at(cache_order_[slot]); const std::size_t length = marks[slot].length + committed; const std::size_t added = committed * cache.kv_heads * cache.head_dim; hash = hash_bytes(hash, &length, sizeof(length)); hash = hash_bytes(hash, cache.key.data(), (marks[slot].key_size + added) * sizeof(float)); hash = hash_bytes(hash, cache.value.data(), (marks[slot].value_size + added) * sizeof(float)); }
+        return hash;
+    }
+    void rollback(const std::vector<CacheMark>& marks, std::size_t committed) {
+        for (std::size_t slot = 0; slot < cache_order_.size(); ++slot) { auto& cache = caches_.at(cache_order_[slot]); const std::size_t added = committed * cache.kv_heads * cache.head_dim; cache.key.resize(marks[slot].key_size + added); cache.value.resize(marks[slot].value_size + added); cache.length = marks[slot].length + committed; }
+    }
+    bool verify_rollback(const std::vector<CacheMark>& marks, std::size_t committed) const {
+        for (std::size_t slot = 0; slot < cache_order_.size(); ++slot) { const auto& cache = caches_.at(cache_order_[slot]); const auto& mark = marks[slot]; const std::size_t added = committed * cache.kv_heads * cache.head_dim; if (cache.length != mark.length + committed || cache.key.size() != mark.key_size + added || cache.value.size() != mark.value_size + added || hash_bytes(1469598103934665603ULL, cache.key.data(), mark.key_size * sizeof(float)) != mark.key_hash || hash_bytes(1469598103934665603ULL, cache.value.data(), mark.value_size * sizeof(float)) != mark.value_hash) return false; }
+        return true;
+    }
+    static std::vector<int> propose_ngrams(const std::vector<int>& history, std::size_t limit) {
+        if (!limit || history.size() < 2) return {};
+        const std::size_t maximum_order = std::min<std::size_t>(4, history.size() - 1);
+        for (std::size_t order = maximum_order; order >= 2; --order) {
+            const std::size_t suffix = history.size() - order; std::vector<int> supported; std::size_t support = 0;
+            for (std::size_t candidate = suffix; candidate-- > 0;) {
+                if (candidate + order >= history.size() || !std::equal(history.begin() + static_cast<std::ptrdiff_t>(candidate), history.begin() + static_cast<std::ptrdiff_t>(candidate + order), history.begin() + static_cast<std::ptrdiff_t>(suffix))) continue;
+                const std::size_t continuation = candidate + order, count = std::min(limit, history.size() - continuation); if (!count) continue;
+                std::vector<int> tokens(history.begin() + static_cast<std::ptrdiff_t>(continuation), history.begin() + static_cast<std::ptrdiff_t>(continuation + count));
+                if (supported.empty()) { supported = std::move(tokens); support = 1; } else if (tokens == supported) ++support;
+            }
+            if (support >= 2) return supported;
+            if (order >= 4 && support == 1) { std::size_t occurrences = 0; for (std::size_t start = 0; start + supported.size() <= history.size(); ++start) if (std::equal(supported.begin(), supported.end(), history.begin() + static_cast<std::ptrdiff_t>(start))) ++occurrences; if (occurrences >= 2) return supported; }
+        }
+        return {};
+    }
     std::size_t shape(const std::string& name) const {
         auto found = plan_.shapes.find(name);
         if (found == plan_.shapes.end() || found->second == 0) throw std::runtime_error("missing plan shape " + name);
@@ -810,6 +988,78 @@ private:
         }
     }
 
+    template <std::size_t Positions>
+    std::vector<float> linear_block_position_panel(
+        const std::vector<float>& input,
+        const Tensor& weight,
+        const Tensor* bias,
+        bool logits
+    ) {
+#if defined(__aarch64__)
+        static_assert(Positions == 8 || Positions == 16);
+        constexpr std::size_t vectors = Positions / 4;
+        const std::size_t rows = weight.shape[0], columns = weight.shape[1];
+        const auto* weights = reinterpret_cast<const std::uint16_t*>(weight.data);
+        std::vector<float> packed_input(columns * Positions);
+        for (std::size_t column = 0; column < columns; ++column) {
+            for (std::size_t position = 0; position < Positions; ++position) {
+                packed_input[column * Positions + position] = input[position * columns + column];
+            }
+        }
+        native_panel_packed_input_bytes_ += packed_input.size() * sizeof(float);
+        std::vector<float> output(Positions * rows);
+        const std::size_t row_blocks = rows / 4;
+        const std::size_t grain = std::min<std::size_t>(4, std::max<std::size_t>(1, row_blocks / (parallel_.threads() * 4)));
+        parallel_.run(row_blocks, grain, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t block = begin; block < end; ++block) {
+                const std::size_t row = block * 4;
+                float32x4_t sums[4][vectors];
+                for (std::size_t r = 0; r < 4; ++r) {
+                    const float initial = bias ? value(*bias, row + r) : 0.0F;
+                    for (std::size_t lane = 0; lane < vectors; ++lane) sums[r][lane] = vdupq_n_f32(initial);
+                }
+                const auto* row0 = weights + row * columns;
+                const auto* row1 = row0 + columns;
+                const auto* row2 = row1 + columns;
+                const auto* row3 = row2 + columns;
+                for (std::size_t column = 0; column < columns; ++column) {
+                    if (column + 64 < columns) { __builtin_prefetch(row0 + column + 64, 0, 1); __builtin_prefetch(row1 + column + 64, 0, 1); __builtin_prefetch(row2 + column + 64, 0, 1); __builtin_prefetch(row3 + column + 64, 0, 1); }
+                    const float w0 = bf16_to_float(row0[column]);
+                    const float w1 = bf16_to_float(row1[column]);
+                    const float w2 = bf16_to_float(row2[column]);
+                    const float w3 = bf16_to_float(row3[column]);
+                    for (std::size_t lane = 0; lane < vectors; ++lane) {
+                        const float32x4_t item = vld1q_f32(packed_input.data() + column * Positions + lane * 4);
+                        sums[0][lane] = vaddq_f32(sums[0][lane], vmulq_f32(item, vdupq_n_f32(w0)));
+                        sums[1][lane] = vaddq_f32(sums[1][lane], vmulq_f32(item, vdupq_n_f32(w1)));
+                        sums[2][lane] = vaddq_f32(sums[2][lane], vmulq_f32(item, vdupq_n_f32(w2)));
+                        sums[3][lane] = vaddq_f32(sums[3][lane], vmulq_f32(item, vdupq_n_f32(w3)));
+                    }
+                }
+                alignas(16) float lanes[4];
+                for (std::size_t r = 0; r < 4; ++r) for (std::size_t lane = 0; lane < vectors; ++lane) {
+                    vst1q_f32(lanes, sums[r][lane]);
+                    for (std::size_t item = 0; item < 4; ++item) {
+                        const float sum = lanes[item];
+                        output[(lane * 4 + item) * rows + row + r] = logits ? quantize_output(sum) : quantize(sum);
+                    }
+                }
+            }
+        });
+        for (std::size_t row = row_blocks * 4; row < rows; ++row) {
+            const auto* row_data = weights + row * columns;
+            for (std::size_t position = 0; position < Positions; ++position) {
+                float sum = bias ? value(*bias, row) : 0.0F;
+                for (std::size_t column = 0; column < columns; ++column) sum += bf16_to_float(row_data[column]) * input[position * columns + column];
+                output[position * rows + row] = logits ? quantize_output(sum) : quantize(sum);
+            }
+        }
+        return output;
+#else
+        (void)input; (void)weight; (void)bias; (void)logits;
+        throw std::runtime_error("experimental native position panel requires AArch64 NEON");
+#endif
+    }
     float value(const Tensor& tensor, std::size_t index) const {
         const std::size_t bytes_per_value = tensor.dtype == DType::F32 ? 4 : 2;
         if (index >= tensor.length / bytes_per_value) throw std::runtime_error("tensor element outside checkpoint");
@@ -875,6 +1125,10 @@ private:
     std::vector<float> linear_block(const std::vector<float>& input, std::size_t positions, const Tensor& weight, const Tensor* bias = nullptr, bool logits = false) {
         if (weight.shape.size() != 2 || !positions || input.size() != positions * weight.shape[1]) throw std::runtime_error("native plan block linear shape mismatch");
         ++matrix_passes_;
+        if (experimental_position_panel_ && weight.dtype == DType::BF16 && reinterpret_cast<std::uintptr_t>(weight.data) % alignof(std::uint16_t) == 0) {
+            if (positions == 8) { ++native_panel_8_calls_; return linear_block_position_panel<8>(input, weight, bias, logits); }
+            if (positions == 16) { ++native_panel_16_calls_; return linear_block_position_panel<16>(input, weight, bias, logits); }
+        }
         const std::size_t rows = weight.shape[0], columns = weight.shape[1];
         std::vector<float> output(positions * rows);
         const std::size_t grain = std::min<std::size_t>(16, std::max<std::size_t>(1, rows / (parallel_.threads() * 4)));
@@ -1049,7 +1303,7 @@ private:
         return values.at("logits");
     }
 
-    Plan plan_; MappedFile weights_; Parallel parallel_; std::unordered_map<std::string, Cache> caches_; std::vector<std::string> cache_order_; std::vector<CompiledOp> compiled_ops_; std::size_t position_{}; std::size_t executed_{}; std::size_t matrix_passes_{}; std::size_t runtime_tensor_lookups_{}; std::size_t prefill_matrix_passes_{}; std::size_t prefill_physical_width_{}; double prefill_seconds_{}; std::vector<std::string> trace_; std::vector<std::vector<float>> frontier_logits_; std::vector<double> decode_intervals_;
+    Plan plan_; MappedFile weights_; Parallel parallel_; std::unordered_map<std::string, Cache> caches_; std::vector<std::string> cache_order_; std::vector<CompiledOp> compiled_ops_; bool experimental_position_panel_{}; std::size_t native_panel_8_calls_{}; std::size_t native_panel_16_calls_{}; std::size_t native_panel_packed_input_bytes_{}; std::size_t position_{}; std::size_t executed_{}; std::size_t matrix_passes_{}; std::size_t runtime_tensor_lookups_{}; std::size_t prefill_matrix_passes_{}; std::size_t prefill_physical_width_{}; double prefill_seconds_{}; std::vector<std::string> trace_; std::vector<std::vector<float>> frontier_logits_; std::vector<std::uint64_t> frontier_logits_hashes_; std::vector<std::uint64_t> frontier_kv_hashes_; std::vector<double> decode_intervals_;
 };
 
 std::vector<int> parse_tokens(const std::string& value) {
@@ -1096,14 +1350,27 @@ template <typename T> void print_nested(const std::vector<std::vector<T>>& value
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 6) throw std::runtime_error("usage: strpot-native-plan PLAN CHECKPOINT TOKENS MAX_NEW THREADS");
-        const auto threads = parse_size(argv[5]);
+        const bool wave_mode = argc > 1 && std::string(argv[1]) == "--token-wave";
+        const bool oracle_mode = argc > 1 && std::string(argv[1]) == "--experimental-perfect-oracle";
+        if ((!wave_mode && !oracle_mode && argc != 6) || (wave_mode && argc != 9) || (oracle_mode && argc != 8)) throw std::runtime_error("usage: strpot-native-plan [--token-wave|--experimental-perfect-oracle] PLAN CHECKPOINT TOKENS MAX_NEW_OR_FUTURE [MAX_PROPOSALS_OR_WIDTH] THREADS [ADVERSARIAL]");
+        const int base = (wave_mode || oracle_mode) ? 2 : 1;
+        const auto threads = parse_size(argv[base + ((wave_mode || oracle_mode) ? 5 : 4)]);
         if (!threads || threads > MAX_PARALLEL_THREADS) throw std::runtime_error("threads exceed safe bound");
         if (std::fesetround(FE_TONEAREST) != 0 || std::fegetround() != FE_TONEAREST) throw std::runtime_error("cannot establish round-to-nearest-even");
-        Executor executor(read_plan(argv[1], argv[2]), argv[2], threads);
-        const auto tokens = executor.generate(parse_tokens(argv[3]), parse_size(argv[4]));
+        Executor executor(read_plan(argv[base], argv[base + 1]), argv[base + 1], threads);
+        Executor::TokenWaveResult wave;
+        std::vector<int> tokens;
+        if (wave_mode) { const auto adversarial = parse_size(argv[base + 6]); if (adversarial > 1) throw std::runtime_error("adversarial must be zero or one"); wave = executor.generate_token_wave(parse_tokens(argv[base + 2]), parse_size(argv[base + 3]), parse_size(argv[base + 4]), adversarial == 1); tokens = wave.tokens; }
+        else if (oracle_mode) { wave = executor.generate_perfect_oracle(parse_tokens(argv[base + 2]), parse_tokens(argv[base + 3]), parse_size(argv[base + 4])); tokens = wave.tokens; }
+        else tokens = executor.generate(parse_tokens(argv[base + 2]), parse_size(argv[base + 3]));
         const auto cache_lengths = executor.cache_lengths(); const auto& plan = executor.plan();
-        std::cout << "{\"engine\":" << json_string("strpot-native-plan") << ",\"architecture_id\":" << json_string(plan.architecture_id) << ",\"config_identity\":" << json_string(plan.config_identity) << ",\"weight_dtype\":" << json_string(plan.weight_dtype) << ",\"kernel_family\":" << json_string(executor.kernel_family()) << ",\"tokens\":"; print_values(tokens); std::cout << ",\"executed_operators\":" << executor.executed() << ",\"matrix_passes\":" << executor.matrix_passes() << ",\"parallel_dispatches\":" << executor.parallel_dispatches() << ",\"threaded_matrix_dispatches\":" << executor.threaded_matrix_dispatches() << ",\"runtime_tensor_lookups\":" << executor.runtime_tensor_lookups() << ",\"prefill_seconds\":" << std::setprecision(17) << executor.prefill_seconds() << ",\"prefill_matrix_passes\":" << executor.prefill_matrix_passes() << ",\"prefill_physical_width\":" << executor.prefill_physical_width() << ",\"kv_cache_lengths\":"; print_values(cache_lengths); std::cout << ",\"frontier_logits\":"; print_nested(executor.frontier_logits()); std::cout << ",\"inter_token_seconds\":"; print_values(executor.decode_intervals()); std::cout << ",\"kv_cache_keys\":"; print_nested(executor.cache_keys()); std::cout << ",\"kv_cache_values\":"; print_nested(executor.cache_values()); std::cout << ",\"operator_trace\":"; print_strings(executor.trace());
+        if (oracle_mode) {
+            const double ratio = wave.target_weight_traversals ? static_cast<double>(wave.committed_decode_tokens) / static_cast<double>(wave.target_weight_traversals) : 0.0;
+            std::cout << "{\"experimental\":\"perfect-oracle-causal-panel-ceiling\",\"tokens\":"; print_values(tokens); std::cout << ",\"target_weight_traversals\":" << wave.target_weight_traversals << ",\"committed_decode_tokens\":" << wave.committed_decode_tokens << ",\"committed_tokens_per_target_weight_traversal\":" << std::setprecision(17) << ratio << ",\"acceptance_lengths\":"; print_values(wave.acceptance_lengths); std::cout << ",\"traversal_seconds\":"; print_values(wave.traversal_seconds); std::cout << ",\"transactional_snapshot_bytes_copied\":" << wave.transactional_snapshot_bytes_copied << ",\"rollback_verified\":" << (wave.rollback_verified ? "true" : "false") << ",\"final_logits_hash\":\"" << executor.final_logits_hash() << "\",\"final_kv_hash\":\"" << executor.final_kv_hash() << "\",\"kv_cache_lengths\":"; print_values(cache_lengths); std::cout << ",\"frontier_logits_hashes\":"; print_values(executor.frontier_logits_hashes()); std::cout << ",\"frontier_kv_hashes\":"; print_values(executor.frontier_kv_hashes()); std::cout << ",\"kernel_family\":" << json_string(executor.kernel_family()) << ",\"native_panel_8_calls\":" << executor.native_panel_8_calls() << ",\"native_panel_16_calls\":" << executor.native_panel_16_calls() << ",\"native_panel_packed_input_bytes\":" << executor.native_panel_packed_input_bytes() << ",\"matrix_passes\":" << executor.matrix_passes() << ",\"runtime_tensor_lookups\":" << executor.runtime_tensor_lookups() << ",\"threads\":" << executor.threads() << "}\n";
+            return 0;
+        }
+        std::cout << "{\"engine\":" << json_string("strpot-native-plan") << ",\"architecture_id\":" << json_string(plan.architecture_id) << ",\"config_identity\":" << json_string(plan.config_identity) << ",\"weight_dtype\":" << json_string(plan.weight_dtype) << ",\"kernel_family\":" << json_string(executor.kernel_family()) << ",\"native_panel_8_calls\":" << executor.native_panel_8_calls() << ",\"native_panel_16_calls\":" << executor.native_panel_16_calls() << ",\"native_panel_packed_input_bytes\":" << executor.native_panel_packed_input_bytes() << ",\"tokens\":"; print_values(tokens); std::cout << ",\"executed_operators\":" << executor.executed() << ",\"matrix_passes\":" << executor.matrix_passes() << ",\"parallel_dispatches\":" << executor.parallel_dispatches() << ",\"threaded_matrix_dispatches\":" << executor.threaded_matrix_dispatches() << ",\"runtime_tensor_lookups\":" << executor.runtime_tensor_lookups() << ",\"prefill_seconds\":" << std::setprecision(17) << executor.prefill_seconds() << ",\"prefill_matrix_passes\":" << executor.prefill_matrix_passes() << ",\"prefill_physical_width\":" << executor.prefill_physical_width() << ",\"kv_cache_lengths\":"; print_values(cache_lengths); std::cout << ",\"frontier_logits\":"; print_nested(executor.frontier_logits()); std::cout << ",\"frontier_logits_hashes\":"; print_values(executor.frontier_logits_hashes()); std::cout << ",\"frontier_kv_hashes\":"; print_values(executor.frontier_kv_hashes()); std::cout << ",\"final_logits_hash\":\"" << executor.final_logits_hash() << "\",\"final_kv_hash\":\"" << executor.final_kv_hash() << "\",\"inter_token_seconds\":"; print_values(executor.decode_intervals()); std::cout << ",\"kv_cache_keys\":"; print_nested(executor.cache_keys()); std::cout << ",\"kv_cache_values\":"; print_nested(executor.cache_values()); std::cout << ",\"operator_trace\":"; print_strings(executor.trace());
+        if (wave_mode) { const double ratio = wave.target_weight_traversals ? static_cast<double>(wave.committed_decode_tokens) / static_cast<double>(wave.target_weight_traversals) : 0.0; std::cout << ",\"target_weight_traversals\":" << wave.target_weight_traversals << ",\"committed_decode_tokens\":" << wave.committed_decode_tokens << ",\"committed_tokens_per_target_weight_traversal\":" << std::setprecision(17) << ratio << ",\"acceptance_lengths\":"; print_values(wave.acceptance_lengths); std::cout << ",\"traversal_seconds\":"; print_values(wave.traversal_seconds); std::cout << ",\"rolled_back_tokens\":" << wave.rolled_back_tokens << ",\"speculative_traversals\":" << wave.speculative_traversals << ",\"fallback_traversals\":" << wave.fallback_traversals << ",\"transactional_snapshot_bytes_copied\":" << wave.transactional_snapshot_bytes_copied << ",\"rollback_verified\":" << (wave.rollback_verified ? "true" : "false"); }
         std::cout << ",\"threads\":" << executor.threads() << "}\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

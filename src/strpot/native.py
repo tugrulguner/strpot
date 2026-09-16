@@ -367,6 +367,38 @@ class NativePlanGenerationResult:
     prefill_seconds: float
     prefill_matrix_passes: int
     prefill_physical_width: int
+    frontier_logits_hashes: tuple[str, ...]
+    frontier_kv_hashes: tuple[str, ...]
+    final_logits_hash: str
+    final_kv_hash: str
+
+
+@dataclass(frozen=True)
+class NativePlanTokenWaveResult:
+    """Compact conformance and traversal report for generic plan token waves."""
+
+    generated_token_ids: tuple[int, ...]
+    target_weight_traversals: int
+    committed_decode_tokens: int
+    committed_tokens_per_target_weight_traversal: float
+    acceptance_lengths: tuple[int, ...]
+    traversal_seconds: tuple[float, ...]
+    rolled_back_tokens: int
+    speculative_traversals: int
+    fallback_traversals: int
+    transactional_snapshot_bytes_copied: int
+    rollback_verified: bool
+    final_logits_hash: str
+    final_kv_hash: str
+    final_kv_lengths: tuple[int, ...]
+    frontier_logits_hashes: tuple[str, ...]
+    frontier_kv_hashes: tuple[str, ...]
+    matrix_passes: int
+    runtime_tensor_lookups: int
+    threads: int
+    kernel_family: str
+    native_panel_8_calls: int
+    native_panel_16_calls: int
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1085,179 @@ class NativeExecutionPlanEngine:
             prefill_seconds=float(report["prefill_seconds"]),
             prefill_matrix_passes=int(report["prefill_matrix_passes"]),
             prefill_physical_width=int(report["prefill_physical_width"]),
+            frontier_logits_hashes=tuple(
+                str(value) for value in report["frontier_logits_hashes"]
+            ),
+            frontier_kv_hashes=tuple(
+                str(value) for value in report["frontier_kv_hashes"]
+            ),
+            final_logits_hash=str(report["final_logits_hash"]),
+            final_kv_hash=str(report["final_kv_hash"]),
+        )
+
+    def generate_token_wave(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_new_tokens: int,
+        max_proposals: int = 3,
+        threads: int,
+        adversarial_proposals: bool = False,
+    ) -> NativePlanTokenWaveResult:
+        """Generate exactly while transactionally verifying history proposals."""
+        self._validate_plan_generation_inputs(
+            prompt_token_ids, max_new_tokens=max_new_tokens, threads=threads
+        )
+        if type(max_proposals) is not int or not 0 <= max_proposals <= 3:
+            raise ValueError("max_proposals must be between zero and three")
+        if type(adversarial_proposals) is not bool:
+            raise ValueError("adversarial_proposals must be a boolean")
+        report = self._run_plan_command(
+            [
+                "--token-wave",
+                str(self.artifact),
+                str(self.checkpoint),
+                ",".join(str(value) for value in prompt_token_ids),
+                str(max_new_tokens),
+                str(max_proposals),
+                str(threads),
+                "1" if adversarial_proposals else "0",
+            ],
+            "token-wave",
+        )
+        return self._plan_wave_result(report)
+
+    def _experimental_generate_perfect_oracle(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        known_future_token_ids: list[int],
+        width: int,
+        threads: int,
+    ) -> NativePlanTokenWaveResult:
+        """Run an internal perfect-proposal ceiling, not practical generation."""
+        self._validate_plan_generation_inputs(
+            prompt_token_ids, max_new_tokens=1, threads=threads
+        )
+        vocab_size = dict(self.plan.shapes)["vocab_size"]
+        if not isinstance(known_future_token_ids, list) or not known_future_token_ids:
+            raise ValueError(
+                "native perfect-oracle inference requires known future tokens"
+            )
+        if any(
+            type(token) is not int or token < 0 or token >= vocab_size
+            for token in known_future_token_ids
+        ):
+            raise ValueError("perfect-oracle token is outside the plan vocabulary")
+        if type(width) is not int or width not in (1, 2, 4, 8, 16):
+            raise ValueError("perfect-oracle width must be 1, 2, 4, 8, or 16")
+        report = self._run_plan_command(
+            [
+                "--experimental-perfect-oracle",
+                str(self.artifact),
+                str(self.checkpoint),
+                ",".join(str(value) for value in prompt_token_ids),
+                ",".join(str(value) for value in known_future_token_ids),
+                str(width),
+                str(threads),
+            ],
+            "experimental perfect-oracle",
+        )
+        if report.get("experimental") != "perfect-oracle-causal-panel-ceiling":
+            raise RuntimeError("native perfect-oracle result lacks experimental marker")
+        return self._plan_wave_result(
+            report,
+            rolled_back_tokens=0,
+            speculative_traversals=int(report["target_weight_traversals"]),
+            fallback_traversals=0,
+        )
+
+    def _validate_plan_generation_inputs(
+        self, prompt_token_ids: list[int], *, max_new_tokens: int, threads: int
+    ) -> None:
+        if not isinstance(prompt_token_ids, list) or not prompt_token_ids:
+            raise ValueError("native inference requires at least one prompt token")
+        vocab_size = dict(self.plan.shapes)["vocab_size"]
+        if any(
+            type(token) is not int or token < 0 or token >= vocab_size
+            for token in prompt_token_ids
+        ):
+            raise ValueError("prompt token is outside the plan vocabulary")
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        if type(threads) is not int or not 1 <= threads <= _MAX_NATIVE_PLAN_THREADS:
+            raise ValueError("threads must be between 1 and 256")
+
+    def _run_plan_command(self, arguments: list[str], operation: str) -> dict[str, Any]:
+        completed = subprocess.run(
+            [str(self.executable), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"StrPot native execution-plan {operation} inference failed:\n"
+                + completed.stdout
+                + completed.stderr
+            )
+        return json.loads(completed.stdout)
+
+    @staticmethod
+    def _plan_wave_result(
+        report: dict[str, Any],
+        *,
+        rolled_back_tokens: int | None = None,
+        speculative_traversals: int | None = None,
+        fallback_traversals: int | None = None,
+    ) -> NativePlanTokenWaveResult:
+        return NativePlanTokenWaveResult(
+            generated_token_ids=tuple(int(value) for value in report["tokens"]),
+            target_weight_traversals=int(report["target_weight_traversals"]),
+            committed_decode_tokens=int(report["committed_decode_tokens"]),
+            committed_tokens_per_target_weight_traversal=float(
+                report["committed_tokens_per_target_weight_traversal"]
+            ),
+            acceptance_lengths=tuple(
+                int(value) for value in report["acceptance_lengths"]
+            ),
+            traversal_seconds=tuple(
+                float(value) for value in report["traversal_seconds"]
+            ),
+            rolled_back_tokens=(
+                int(report["rolled_back_tokens"])
+                if rolled_back_tokens is None
+                else rolled_back_tokens
+            ),
+            speculative_traversals=(
+                int(report["speculative_traversals"])
+                if speculative_traversals is None
+                else speculative_traversals
+            ),
+            fallback_traversals=(
+                int(report["fallback_traversals"])
+                if fallback_traversals is None
+                else fallback_traversals
+            ),
+            transactional_snapshot_bytes_copied=int(
+                report["transactional_snapshot_bytes_copied"]
+            ),
+            rollback_verified=bool(report["rollback_verified"]),
+            final_logits_hash=str(report["final_logits_hash"]),
+            final_kv_hash=str(report["final_kv_hash"]),
+            final_kv_lengths=tuple(int(value) for value in report["kv_cache_lengths"]),
+            frontier_logits_hashes=tuple(
+                str(value) for value in report["frontier_logits_hashes"]
+            ),
+            frontier_kv_hashes=tuple(
+                str(value) for value in report["frontier_kv_hashes"]
+            ),
+            matrix_passes=int(report["matrix_passes"]),
+            runtime_tensor_lookups=int(report["runtime_tensor_lookups"]),
+            threads=int(report["threads"]),
+            kernel_family=str(report["kernel_family"]),
+            native_panel_8_calls=int(report["native_panel_8_calls"]),
+            native_panel_16_calls=int(report["native_panel_16_calls"]),
         )
 
 
